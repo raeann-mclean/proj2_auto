@@ -1,0 +1,257 @@
+---
+# Project 2 — Part 2: harden a freshly broken box.
+# Run with: sudo ansible-pull -U https://github.com/raeann-mclean/proj2_auto.git
+
+- name: Harden the Project 2 box
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    # ---------- System / SSH ----------
+    bad_sshd_dropin: /etc/ssh/sshd_config.d/99-course.conf
+    ftp_unit: ftp.service                  # systemd unit running python3 on :21
+    ftp_unit_file: /etc/systemd/system/ftp.service
+    cron_files:                            # every file holding the rogue job
+      - /etc/cron.d/log-rotate
+    open_dir: /var/www/app/tmp             # world-writable application directory
+    open_dir_owner: www-data
+    open_dir_group: www-data
+    open_dir_mode: "0750"
+
+    # ---------- Users / privilege escalation ----------
+    rogue_admin: monitor
+    nopasswd_file: /etc/sudoers.d/90-course-nopasswd
+    suid_binary: /usr/local/bin/diagtool
+    empty_pw_user: demo
+    creds_file: /opt/app/config.yml
+    creds_owner: root
+    creds_group: root
+
+    # ---------- Database ----------
+    mysql_socket: /var/run/mysqld/mysqld.sock
+    webapp_hosts: ["%"]                    # setup creates webapp@'%'
+    reporting_hosts: ["%"]                 # setup creates reporting@'%'
+    bad_root_hosts: ["%"]
+    stale_db_users: []
+
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+
+  tasks:
+    # ================= Packages =================
+    - name: Install hardening tools and the MySQL driver
+      ansible.builtin.apt:
+        name: [fail2ban, python3-systemd, python3-pymysql, ufw]
+        state: present
+        update_cache: true
+        cache_valid_time: 86400
+
+    # ================= SSH =================
+    - name: Remove the drop-in that re-enables root/password login
+      ansible.builtin.file:
+        path: "{{ bad_sshd_dropin }}"
+        state: absent
+      notify: Restart ssh
+
+    - name: Hardened sshd settings (loaded first, so they win)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart ssh
+
+    # ================= Firewall =================
+    # `ufw show added` lists rules even while UFW is inactive (`ufw status` does not).
+    - name: Read configured UFW rules
+      ansible.builtin.command: ufw show added
+      register: ufw_added
+      changed_when: false
+      check_mode: false
+
+    - name: Reset UFW only if anything besides 22/tcp is configured
+      community.general.ufw:
+        state: reset
+      when: >-
+        ufw_added.stdout_lines
+        | select('match', '^ufw ')
+        | reject('match', '^ufw allow 22/tcp$')
+        | list | length > 0
+
+    - name: Default deny incoming
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: Default allow outgoing
+      community.general.ufw:
+        default: allow
+        direction: outgoing
+
+    - name: Allow SSH
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+
+    # ================= Cron =================
+    - name: Remove the unauthorized scheduled job
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ cron_files }}"
+
+    # ================= Listening service =================
+    - name: Look for the rogue FTP unit file
+      ansible.builtin.stat:
+        path: "{{ ftp_unit_file }}"
+      register: ftp_unit_stat
+
+    # Only while the real unit file is there (after masking it is a /dev/null symlink).
+    - name: Stop and disable the rogue FTP service
+      ansible.builtin.systemd:
+        name: "{{ ftp_unit }}"
+        state: stopped
+        enabled: false
+      when: ftp_unit_stat.stat.isreg | default(false)
+
+    - name: Remove the rogue FTP unit file (mask cannot replace a real file)
+      ansible.builtin.file:
+        path: "{{ ftp_unit_file }}"
+        state: absent
+      register: ftp_unit_removed
+      when: ftp_unit_stat.stat.isreg | default(false)
+
+    - name: Reload systemd after removing the unit
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: ftp_unit_removed is changed
+
+    - name: Mask the rogue FTP service so nothing can start it again
+      ansible.builtin.systemd:
+        name: "{{ ftp_unit }}"
+        masked: true
+
+    # ================= fail2ban =================
+    - name: fail2ban sshd jail
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          ignoreip = 127.0.0.1/8 ::1
+          bantime  = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          backend = systemd
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart fail2ban
+
+    - name: fail2ban running and enabled
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: started
+        enabled: true
+
+    # ================= Directory permissions =================
+    - name: Lock down the world-writable app directory
+      ansible.builtin.file:
+        path: "{{ open_dir }}"
+        state: directory
+        owner: "{{ open_dir_owner }}"
+        group: "{{ open_dir_group }}"
+        mode: "{{ open_dir_mode }}"
+
+    # ================= Users / privesc =================
+    - name: Remove the unauthorized admin account
+      ansible.builtin.user:
+        name: "{{ rogue_admin }}"
+        state: absent
+        remove: true
+        force: true
+
+    - name: Remove the NOPASSWD sudoers rule
+      ansible.builtin.file:
+        path: "{{ nopasswd_file }}"
+        state: absent
+
+    - name: Remove the planted SUID-root binary
+      ansible.builtin.file:
+        path: "{{ suid_binary }}"
+        state: absent
+
+    - name: Lock the account that had an empty password
+      ansible.builtin.user:
+        name: "{{ empty_pw_user }}"
+        password_lock: true
+
+    - name: Restrict the exposed credentials file
+      ansible.builtin.file:
+        path: "{{ creds_file }}"
+        owner: "{{ creds_owner }}"
+        group: "{{ creds_group }}"
+        mode: "0600"
+
+    # ================= Database least privilege =================
+    - name: webapp = SELECT/INSERT/UPDATE/DELETE on ticketdb only
+      community.mysql.mysql_user:
+        login_unix_socket: "{{ mysql_socket }}"
+        name: webapp
+        host: "{{ item }}"
+        priv: "ticketdb.*:SELECT,INSERT,UPDATE,DELETE"
+        append_privs: false
+        state: present
+      loop: "{{ webapp_hosts }}"
+
+    - name: reporting = SELECT on ticketdb only
+      community.mysql.mysql_user:
+        login_unix_socket: "{{ mysql_socket }}"
+        name: reporting
+        host: "{{ item }}"
+        priv: "ticketdb.*:SELECT"
+        append_privs: false
+        state: present
+      loop: "{{ reporting_hosts }}"
+
+    - name: Drop non-local root accounts
+      community.mysql.mysql_user:
+        login_unix_socket: "{{ mysql_socket }}"
+        name: root
+        host: "{{ item }}"
+        state: absent
+      loop: "{{ bad_root_hosts }}"
+
+    - name: Drop anonymous accounts
+      community.mysql.mysql_user:
+        login_unix_socket: "{{ mysql_socket }}"
+        name: ""
+        host_all: true
+        state: absent
+
+    - name: Drop stale accounts
+      community.mysql.mysql_user:
+        login_unix_socket: "{{ mysql_socket }}"
+        name: "{{ item.name }}"
+        host: "{{ item.host }}"
+        state: absent
+      loop: "{{ stale_db_users }}"
